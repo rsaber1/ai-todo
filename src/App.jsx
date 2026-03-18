@@ -379,28 +379,52 @@ function TaskModal({ task, apiKey, onUpdate, onClose }) {
 // ── Voice Orb ──────────────────────────────────────────────────────────────
 
 function VoiceOrb({ apiKey, voice, tasks, onTasksUpdate, onClose }) {
-  const [phase, setPhase] = useState("idle"); // idle | listening | thinking | speaking
-  const recognitionRef = useRef(null);
+  const [phase, setPhase] = useState("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
   const audioRef = useRef(null);
   const activeRef = useRef(true);
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
 
-  const speak = useCallback(async (text) => {
+  const phaseColors = { idle: "#1565C0", listening: "#43A047", thinking: "#FB8C00", speaking: "#6A1B9A" };
+  const phaseLabels = { idle: "Starting…", listening: "Listening — speak now", thinking: "Thinking…", speaking: "Speaking…" };
+
+  const speak = async (text) => {
+    if (!activeRef.current) return;
     setPhase("speaking");
     try {
       const url = await textToSpeech(apiKey, text, voice);
       const audio = new Audio(url);
       audioRef.current = audio;
-      await new Promise(resolve => { audio.onended = resolve; audio.onerror = resolve; audio.play(); });
+      await new Promise(resolve => { audio.onended = resolve; audio.onerror = resolve; audio.play().catch(resolve); });
       URL.revokeObjectURL(url);
     } catch (e) { console.error("TTS error:", e); }
     if (activeRef.current) startListening();
-  }, [apiKey, voice]);
+  };
 
-  const processTranscript = useCallback(async (transcript, currentTasks) => {
+  const processAudio = async (audioBlob) => {
+    if (!activeRef.current) return;
     setPhase("thinking");
     try {
-      const raw = await callGPT(apiKey, VOICE_PROMPT + `\n\nCurrent tasks (JSON): ${JSON.stringify(currentTasks)}\n\nIf the user wants to modify tasks, ALSO return a JSON block at the very end of your response in this exact format (after your spoken reply):\n<TASKS_UPDATE>${JSON.stringify([])}</TASKS_UPDATE>\nOtherwise omit the block entirely.`,
-        transcript, false);
+      const formData = new FormData();
+      formData.append("file", audioBlob, "audio.webm");
+      formData.append("model", "whisper-1");
+      const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: formData,
+      });
+      if (!whisperRes.ok) throw new Error("Whisper transcription failed");
+      const { text: transcript } = await whisperRes.json();
+      if (!transcript?.trim()) { if (activeRef.current) startListening(); return; }
+
+      const raw = await callGPT(
+        apiKey,
+        VOICE_PROMPT + `\n\nCurrent tasks (JSON): ${JSON.stringify(tasksRef.current)}\n\nIf the user wants to modify tasks, return a JSON block at the very end:\n<TASKS_UPDATE>[updated tasks array]</TASKS_UPDATE>\nOtherwise omit it.`,
+        transcript, false
+      );
 
       let reply = raw;
       const updateMatch = raw.match(/<TASKS_UPDATE>([\s\S]*?)<\/TASKS_UPDATE>/);
@@ -411,63 +435,85 @@ function VoiceOrb({ apiKey, voice, tasks, onTasksUpdate, onClose }) {
           if (Array.isArray(updatedTasks) && updatedTasks.length > 0) onTasksUpdate(updatedTasks);
         } catch (_) {}
       }
-      if (activeRef.current) await speak(reply);
+      await speak(reply);
     } catch (e) {
-      if (activeRef.current) await speak("Sorry, I ran into an error. Try again.");
+      setErrorMsg(e.message);
+      if (activeRef.current) await speak("Sorry, I hit an error. Please try again.");
     }
-  }, [apiKey, speak, onTasksUpdate]);
+  };
 
-  const startListening = useCallback(() => {
+  const startListening = async () => {
     if (!activeRef.current) return;
     setPhase("listening");
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) { alert("Speech recognition not supported in this browser."); return; }
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en-US"; recognition.interimResults = false; recognition.maxAlternatives = 1;
-    recognitionRef.current = recognition;
-    recognition.onresult = (e) => {
-      const transcript = e.results[0][0].transcript;
-      processTranscript(transcript, tasks);
-    };
-    recognition.onerror = () => { if (activeRef.current) startListening(); };
-    recognition.onend = () => { if (activeRef.current && phase === "listening") startListening(); };
-    recognition.start();
-  }, [tasks, processTranscript, phase]);
+    setErrorMsg("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
+      const recorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = recorder;
+      chunksRef.current = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        if (blob.size > 5000) processAudio(blob);
+        else if (activeRef.current) startListening();
+      };
+      recorder.start();
+      setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 8000);
+    } catch (e) {
+      setErrorMsg("Microphone access denied — please allow mic permissions and try again.");
+      setPhase("idle");
+    }
+  };
 
   useEffect(() => {
     activeRef.current = true;
     startListening();
     return () => {
       activeRef.current = false;
-      recognitionRef.current?.stop();
+      mediaRecorderRef.current?.stop();
       audioRef.current?.pause();
     };
   }, []);
 
-  const phaseColors = { idle: "#1565C0", listening: "#43A047", thinking: "#FB8C00", speaking: "#6A1B9A" };
-  const phaseLabels = { idle: "Starting…", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" };
-
-  const pulseStyle = phase === "listening" ? {
-    animation: "pulse 1.5s ease-in-out infinite",
-  } : {};
+  const handleOrbClick = () => {
+    if (phase === "listening" && mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    } else if (phase === "idle") {
+      startListening();
+    }
+  };
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 400 }}>
-      <style>{`@keyframes pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.12);opacity:0.85} }`}</style>
-
-      <div style={{ ...pulseStyle, width: "120px", height: "120px", borderRadius: "50%", background: phaseColors[phase], display: "flex", alignItems: "center", justifyContent: "center", marginBottom: "24px", transition: "background 0.4s", boxShadow: `0 0 40px ${phaseColors[phase]}66` }}>
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none">
-          {phase === "speaking"
-            ? <><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="white" opacity="0.5"/><path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="white" strokeWidth="2" strokeLinecap="round"/><line x1="12" y1="19" x2="12" y2="23" stroke="white" strokeWidth="2" strokeLinecap="round"/></>
-            : <><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="white"/><path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="white" strokeWidth="2" strokeLinecap="round"/><line x1="12" y1="19" x2="12" y2="23" stroke="white" strokeWidth="2" strokeLinecap="round"/></>
-          }
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.88)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 400 }}>
+      <style>{`
+        @keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.1)} }
+        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+      `}</style>
+      <div onClick={handleOrbClick} style={{
+        width: "130px", height: "130px", borderRadius: "50%",
+        background: phaseColors[phase],
+        display: "flex", alignItems: "center", justifyContent: "center",
+        marginBottom: "28px", transition: "background 0.4s",
+        boxShadow: `0 0 50px ${phaseColors[phase]}55`,
+        cursor: phase === "listening" ? "pointer" : "default",
+        animation: phase === "listening" ? "pulse 1.8s ease-in-out infinite" : phase === "thinking" ? "spin 2s linear infinite" : "none",
+      }}>
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="white" opacity={phase === "speaking" ? 0.5 : 1}/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="white" strokeWidth="2" strokeLinecap="round"/>
+          <line x1="12" y1="19" x2="12" y2="23" stroke="white" strokeWidth="2" strokeLinecap="round"/>
+          <line x1="8" y1="23" x2="16" y2="23" stroke="white" strokeWidth="2" strokeLinecap="round"/>
         </svg>
       </div>
-
-      <div style={{ color: "white", fontSize: "18px", fontFamily: "Georgia, serif", marginBottom: "8px" }}>{phaseLabels[phase]}</div>
-      <div style={{ color: "rgba(255,255,255,0.5)", fontSize: "13px", fontFamily: "Georgia, serif", marginBottom: "40px" }}>Speak to manage your tasks</div>
-
-      <button onClick={onClose} style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.3)", borderRadius: "24px", color: "white", padding: "10px 28px", fontSize: "14px", cursor: "pointer", fontFamily: "Georgia, serif" }}>
+      <div style={{ color: "white", fontSize: "20px", fontFamily: "Georgia, serif", marginBottom: "8px" }}>{phaseLabels[phase]}</div>
+      <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "13px", fontFamily: "Georgia, serif", marginBottom: "12px" }}>
+        {phase === "listening" ? "Recording up to 8s — tap orb to send early" : "Speak to manage your tasks"}
+      </div>
+      {errorMsg && <div style={{ color: "#EF9A9A", fontSize: "13px", fontFamily: "Georgia, serif", marginBottom: "12px", maxWidth: "300px", textAlign: "center" }}>⚠ {errorMsg}</div>}
+      <button onClick={() => { activeRef.current = false; mediaRecorderRef.current?.stop(); audioRef.current?.pause(); onClose(); }}
+        style={{ marginTop: "24px", background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.25)", borderRadius: "24px", color: "white", padding: "10px 32px", fontSize: "14px", cursor: "pointer", fontFamily: "Georgia, serif" }}>
         End voice session
       </button>
     </div>
