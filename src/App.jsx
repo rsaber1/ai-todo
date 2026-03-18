@@ -569,7 +569,7 @@ export default function App() {
   const [voice, setVoice] = useState(() => localStorage.getItem("oai_todo_voice") || "nova");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [showKeyModal, setShowKeyModal] = useState(() => !localStorage.getItem("oai_todo_key"));
-  const [tasks, setTasks] = useState([]);
+  const [tasks, setTasks] = useState(() => { try { return JSON.parse(localStorage.getItem("oai_todo_tasks") || "[]"); } catch { return []; } });
   const [command, setCommand] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("Type a command or import a conversation to get started");
@@ -583,6 +583,8 @@ export default function App() {
   const [filter, setFilter] = useState("all"); // all | active | done
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
+
+  useEffect(() => { localStorage.setItem("oai_todo_tasks", JSON.stringify(tasks)); }, [tasks]);
 
   const handleKeySubmit = () => {
     if (!apiKeyInput.trim()) return;
